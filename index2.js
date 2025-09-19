@@ -1,4 +1,4 @@
-// ssg_scrape_v3_paged.js
+// ssg_scrape_v3_paged_withLogs.js
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const fs = require("fs-extra");
@@ -10,8 +10,8 @@ const TARGET_URL =
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// 수집할 최대 페이지 수(필요 시 null => 가능한 전체 페이지)
-const MAX_PAGES = null; // 예: 5 로 두면 1~5페이지만
+// 수집할 최대 페이지 수 (null이면 가능한 전부)
+const MAX_PAGES = null;
 
 function sanitizeFilename(name) {
   return name.replace(/[\\/:*?"<>|]/g, "_").trim();
@@ -26,7 +26,6 @@ async function downloadImage(url, savePath) {
 }
 
 async function autoScroll(page) {
-  // 페이지 내 동적 로딩 대비
   await page.evaluate(async () => {
     await new Promise((resolve) => {
       let total = 0;
@@ -47,9 +46,6 @@ async function wait(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * 현재 페이지 번호 읽기
- */
 async function getCurrentPageNum(page) {
   const cur = await page
     .$eval(".paging", (el) => {
@@ -60,10 +56,6 @@ async function getCurrentPageNum(page) {
   return Number.isFinite(cur) ? cur : 1;
 }
 
-/**
- * 페이징에서 마지막 페이지 번호(대략) 추정
- * - .paging 내 a/strong 중 숫자의 최댓값 사용
- */
 async function getMaxPageNumFromDOM(page) {
   const max = await page
     .$eval(".paging", (el) => {
@@ -79,13 +71,8 @@ async function getMaxPageNumFromDOM(page) {
   return max || 1;
 }
 
-/**
- * 주어진 페이지 번호로 이동
- * - window.itemLister.changePage(n) 가 있으면 직접 호출
- * - 없으면 onclick으로 해당 a를 클릭
- */
 async function goToPage(page, targetPageNum) {
-  // 페이지 전환 전, 리스트 첫 아이템의 고유 값(예: 첫 a href) 캡쳐
+  console.log(`➡️  페이지 ${targetPageNum}로 이동 시도 중...`);
   const beforeKey = await page
     .$eval("#ty_thmb_view", (wrap) => {
       const first = wrap.querySelector("ul > li:first-child a");
@@ -93,7 +80,6 @@ async function goToPage(page, targetPageNum) {
     })
     .catch(() => "");
 
-  // 정석: itemLister가 노출된 경우 직접 호출
   const called = await page
     .evaluate((n) => {
       try {
@@ -110,40 +96,27 @@ async function goToPage(page, targetPageNum) {
     .catch(() => false);
 
   if (!called) {
-    // 폴백: onclick="itemLister.changePage(n)" a를 찾아 클릭
-    const clicked = await page
+    await page
       .$eval(
         ".paging",
         (root, n) => {
           const links = Array.from(root.querySelectorAll("a"));
-          // 정확히 해당 페이지 번호인 링크 우선
           let el = links.find((a) => a.textContent.trim() === String(n));
-          // 없으면 다음/이전 버튼들 중 onclick 매칭
           if (!el) {
             el = links.find((a) => {
               const oc = a.getAttribute("onclick") || "";
               return oc.includes(`itemLister.changePage(${n})`);
             });
           }
-          if (el) {
-            el.click();
-            return true;
-          }
-          return false;
+          if (el) el.click();
         },
         targetPageNum
       )
-      .catch(() => false);
-
-    if (!clicked) {
-      throw new Error(
-        `페이지 ${targetPageNum}로 이동할 링크를 찾지 못했습니다.`
-      );
-    }
+      .catch(() => {
+        throw new Error(`페이지 ${targetPageNum} 이동 실패`);
+      });
   }
 
-  // 전환 완료 대기: 현재 페이지 strong이 targetPageNum가 될 때까지, 또는 리스트 변화 확인
-  // 1) strong 변화 감지
   try {
     await page.waitForFunction(
       (n) => {
@@ -157,7 +130,6 @@ async function goToPage(page, targetPageNum) {
       targetPageNum
     );
   } catch (_) {
-    // 2) 리스트 변화 키 감지(첫 아이템 href가 바뀔 때까지)
     await page
       .waitForFunction(
         (prevKey) => {
@@ -175,15 +147,11 @@ async function goToPage(page, targetPageNum) {
       .catch(() => {});
   }
 
-  // 새 목록 로딩 안정화
   await autoScroll(page);
   await wait(800 + Math.floor(Math.random() * 400));
+  console.log(`✅ 페이지 ${targetPageNum} 로딩 완료`);
 }
 
-/**
- * 현재 페이지의 아이템 추출
- * - 선택자는 사용자께서 지정한 구조로 고정
- */
 async function scrapeItemsOnPage(page) {
   await page
     .waitForSelector("#ty_thmb_view > ul > li", { timeout: 20000 })
@@ -200,64 +168,56 @@ async function scrapeItemsOnPage(page) {
       }
     };
 
-    return lis
-      .map((li) => {
-        const a = li.querySelector("div > a");
-        const href = a?.getAttribute("href") || a?.href || null;
-        const url = href ? resolveAbs(href) : null;
+    return lis.map((li) => {
+      const a = li.querySelector("div > a");
+      const href = a?.getAttribute("href") || a?.href || null;
+      const url = href ? resolveAbs(href) : null;
 
-        const brandEl = li.querySelector(
-          "div > a > div.mnemitem_tit > span.mnemitem_goods_brand"
-        );
-        const brand = brandEl?.textContent?.trim() || null;
+      const brandEl = li.querySelector(
+        "div > a > div.mnemitem_tit > span.mnemitem_goods_brand"
+      );
+      const brand = brandEl?.textContent?.trim() || null;
 
-        const titleEl = li.querySelector(
-          "div > a > div.mnemitem_tit > span.mnemitem_goods_tit"
-        );
-        const title = titleEl?.textContent?.trim() || null;
+      const titleEl = li.querySelector(
+        "div > a > div.mnemitem_tit > span.mnemitem_goods_tit"
+      );
+      const title = titleEl?.textContent?.trim() || null;
 
-        const imgEl = li.querySelector("div > a img");
-        let imageUrl =
-          imgEl?.getAttribute("data-src") ||
-          imgEl?.getAttribute("data-original") ||
-          imgEl?.getAttribute("src") ||
-          null;
+      const imgEl = li.querySelector("div > a img");
+      let imageUrl =
+        imgEl?.getAttribute("data-src") ||
+        imgEl?.getAttribute("data-original") ||
+        imgEl?.getAttribute("src") ||
+        null;
 
-        // srcset로만 주는 경우 가장 마지막(큰) 소스 사용
-        if (!imageUrl) {
-          const srcset = imgEl?.getAttribute("srcset");
-          if (srcset) {
-            const candidates = srcset
-              .split(",")
-              .map((s) => s.trim().split(" ")[0])
-              .filter(Boolean);
-            if (candidates.length) imageUrl = candidates[candidates.length - 1];
-          }
+      if (!imageUrl) {
+        const srcset = imgEl?.getAttribute("srcset");
+        if (srcset) {
+          const candidates = srcset
+            .split(",")
+            .map((s) => s.trim().split(" ")[0])
+            .filter(Boolean);
+          if (candidates.length) imageUrl = candidates[candidates.length - 1];
         }
+      }
+      if (imageUrl) {
+        try {
+          imageUrl = new URL(imageUrl, location.href).toString();
+        } catch {}
+      }
 
-        if (imageUrl) {
-          try {
-            imageUrl = new URL(imageUrl, location.href).toString();
-          } catch {}
-        }
-
-        return { url, brand, title, imageUrl };
-      })
-      .filter(Boolean);
+      return { url, brand, title, imageUrl };
+    });
   });
 
+  console.log(`📦 ${items.length}개 아이템 추출 완료`);
   return items;
 }
 
 (async () => {
   const browser = await puppeteer.launch({
     headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-features=site-per-process",
-    ],
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   const page = await browser.newPage();
@@ -267,7 +227,6 @@ async function scrapeItemsOnPage(page) {
   });
   await page.setViewport({ width: 1440, height: 900 });
 
-  // 탐지 완화
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
     Object.defineProperty(navigator, "languages", {
@@ -279,120 +238,88 @@ async function scrapeItemsOnPage(page) {
 
   const allResults = [];
   try {
+    console.log("🌐 페이지 접속 중...");
     await page.goto(TARGET_URL, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
     await page.waitForSelector("#ty_thmb_view > ul > li", { timeout: 30000 });
 
-    // 첫 페이지 수집
     let current = await getCurrentPageNum(page);
+    console.log(`🔎 현재 페이지: ${current}`);
     let lastInDOM = await getMaxPageNumFromDOM(page);
+    console.log(`📑 DOM에서 감지한 마지막 페이지: ${lastInDOM}`);
 
-    const firstPageItems = await scrapeItemsOnPage(page);
+    let firstPageItems = await scrapeItemsOnPage(page);
     allResults.push({ page: current, items: firstPageItems });
 
-    // 실제 최대 순회 페이지 결정
-    let hardMax = MAX_PAGES && Number.isFinite(MAX_PAGES) ? MAX_PAGES : null;
-
-    // 페이지 루프
     while (true) {
-      // 다음 페이지 번호 계산
       current = await getCurrentPageNum(page);
       lastInDOM = await getMaxPageNumFromDOM(page);
       const next = current + 1;
 
-      // 하드 제한
-      if (hardMax && next > hardMax) break;
-
-      // 더 이상 링크가 없는 경우 종료(대략 추정)
-      if (next > lastInDOM) {
-        // 혹시 '다음' 버튼으로 넘어가는 구간이 있을 수 있어 한 번 더 시도
-        const hasNextBtn = await page
-          .$(".paging a.btn_next")
-          .then(Boolean)
-          .catch(() => false);
-        if (!hasNextBtn) break;
+      if (MAX_PAGES && next > MAX_PAGES) {
+        console.log("⛔️ 설정한 MAX_PAGES 도달, 중단합니다.");
+        break;
       }
-
-      // 페이지 이동
-      try {
-        await goToPage(page, next);
-      } catch (e) {
-        // next가 없으면 종료
+      if (next > lastInDOM) {
+        console.log("⛔️ 더 이상 다음 페이지 없음, 종료합니다.");
         break;
       }
 
-      // 수집
+      await goToPage(page, next);
       const items = await scrapeItemsOnPage(page);
-      const now = await getCurrentPageNum(page);
-      allResults.push({ page: now, items });
-
-      // 매너 대기
-      await wait(400 + Math.floor(Math.random() * 400));
+      allResults.push({ page: next, items });
     }
 
-    // 저장
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const outDir = `./output/ssg_${ts}`;
     const imgDir = `${outDir}/images`;
     await fs.ensureDir(imgDir);
 
-    // 이미지 저장 + 결과 평탄화
     const flat = [];
     for (const grp of allResults) {
       for (const [idx, item] of grp.items.entries()) {
-        if (!item.title && !item.url && !item.imageUrl) continue;
+        if (!item.title && !item.imageUrl) continue;
 
         let savedImagePath = null;
         if (item.imageUrl && item.title) {
           const baseName = sanitizeFilename(item.title);
           const extMatch = item.imageUrl
             .split("?")[0]
-            .match(/\.(jpg|jpeg|png|webp|gif|bmp|avif)$/i);
+            .match(/\.(jpg|jpeg|png|webp|gif)$/i);
           const ext = extMatch ? extMatch[0] : ".jpg";
-          // 같은 제목이 여러 페이지에 있을 수 있어 페이지/인덱스 접두어 추가
           const savePath = `${imgDir}/${String(grp.page).padStart(
             2,
             "0"
           )}_${String(idx + 1).padStart(3, "0")}_${baseName}${ext}`;
           try {
+            console.log(`🖼️  이미지 저장: ${savePath}`);
             await downloadImage(item.imageUrl, savePath);
             savedImagePath = savePath;
-          } catch (e) {
-            console.warn("이미지 저장 실패:", item.imageUrl);
+          } catch {
+            console.warn("⚠️ 이미지 저장 실패:", item.imageUrl);
           }
-          await wait(150 + Math.floor(Math.random() * 200));
+          await wait(100);
         }
 
-        flat.push({
-          page: grp.page,
-          url: item.url,
-          brand: item.brand,
-          title: item.title,
-          imageUrl: item.imageUrl,
-          imageLocalPath: savedImagePath,
-        });
+        flat.push({ page: grp.page, ...item, imageLocalPath: savedImagePath });
       }
     }
 
     await fs.outputJSON(
       `${outDir}/result.json`,
-      {
-        source: TARGET_URL,
-        scrapedAt: new Date().toISOString(),
-        pageCount: allResults.length,
-        count: flat.length,
-        items: flat,
-      },
+      { source: TARGET_URL, count: flat.length, items: flat },
       { spaces: 2 }
     );
 
-    console.log("✅ 수집 완료");
-    console.log("페이지 수:", allResults.length, " / 항목 수:", flat.length);
+    console.log("🎉 크롤링 완료!");
+    console.log(
+      `총 페이지 수: ${allResults.length}, 총 아이템 수: ${flat.length}`
+    );
     console.log("📂 출력 폴더:", outDir);
   } catch (err) {
-    console.error("오류:", err);
+    console.error("🚨 오류 발생:", err);
   } finally {
     await browser.close();
   }
